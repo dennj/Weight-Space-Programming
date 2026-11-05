@@ -419,9 +419,21 @@ class Program:
             raise PipeError("unsupported operator", n)
         if isinstance(n, ast.IfExp):
             return self._eval(n.body if self._bool(n.test, ctx) else n.orelse, ctx)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in (REC + "bit", REC + "bits"):
+            return self._builtin(n, ctx)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in self.pipes:
             raise PipeError("pipes do not return values; call them as statements", n)
         raise PipeError(f"unsupported expression: {ast.unparse(n)}", n)
+
+    def _builtin(self, n, ctx):
+        """Internal functions that lowered programs use to pack values into stack frames of Bool channels:
+        rec_bit(x, i) is bit i of x (mod 256), and rec_bits(b0, ..., b7) is the Byte with those bits."""
+        if n.func.id == REC + "bit":
+            t, v = self._eval(n.args[0], ctx)
+            if not intlike(t):
+                raise PipeError(f"{REC}bit() takes an integer", n)
+            return ("bool",), (v % 256 >> n.args[1].value) & 1
+        return ("byte",), sum(self._bool(a, ctx) << i for i, a in enumerate(n.args))
 
     @staticmethod
     def _is_const(n):
@@ -630,6 +642,13 @@ class Lin:
         """If this is exactly one byte word (bits with coefficients 2^i), return its slots by bit."""
         if self.const or self.mod:
             return None
+        if self.coefs and all(s[0] == "st" for s in self.coefs):     # rec_bits(...) of Bool state variables
+            by = {}
+            for s, c in self.coefs.items():
+                if c <= 0 or c & (c - 1) or c >= 256 or c.bit_length() - 1 in by:
+                    return None
+                by[c.bit_length() - 1] = s
+            return by
         by = {}
         for s, c in self.coefs.items():
             if s[0] not in ("stb", "fdb") or c != 2 ** s[-1]:
@@ -855,6 +874,10 @@ class Compiler:
         if isinstance(n, ast.IfExp):
             c = self.cond_of(self._seval(n.test, env, loc, path), n.test)
             return ITE(c, self._seval(n.body, env, loc, path), self._seval(n.orelse, env, loc, path))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == REC + "bit":
+            return Op("bit", (self._seval(n.args[0], env, loc, path), Const(n.args[1].value, ("int",))), ("bool",))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == REC + "bits":
+            return Op("bits", tuple(self._seval(a, env, loc, path) for a in n.args), ("byte",))
         raise PipeError(f"unsupported expression: {ast.unparse(n)}", n)
 
     # ---------------------------------------------------------------- lowering of values
@@ -883,6 +906,11 @@ class Compiler:
             return out
         if n.op in ("==", "!=", "<", "<=", ">", ">="):
             return self._compare(n.op, *n.args)
+        if n.op == "bit":                                   # bit i of a byte value
+            out = []
+            for c, v in self.values(n.args[0]):
+                out += A.conj(c, self.byte_bits(v)[n.args[1].val])
+            return out
         raise Deep(f"unsupported Boolean operation {n.op}")
 
     def _compare(self, op, a, b):
@@ -970,6 +998,10 @@ class Compiler:
             c = self._cond(n)
             return [(c, 1), (A.neg(c), 0)]
         op = n.op
+        if op == "bits":                                    # a Byte from Bool bits
+            if all(isinstance(a, Inp) and a.t[0] == "bool" for a in n.args):
+                return [([({}, None)], Lin({("st", a.v): 2 ** i for i, a in enumerate(n.args)}, 0))]
+            return [([({}, None)], BitsV([self._cond(a) for a in n.args] + [[]] * (8 - len(n.args))))]
         if op in ("+", "-"):
             out = []
             sign = 1 if op == "+" else -1
@@ -1852,6 +1884,33 @@ def _runs(vals):
 REC = "rec_"           # prefix of every name the front end generates
 
 
+def _primes(limit):
+    return [p for p in range(2, limit) if all(p % d for d in range(2, int(p ** 0.5) + 1))]
+
+
+def _set_code(N, K):
+    """The narrowest exact superposition code for sets of at most K out of N elements (Kautz-Singleton).
+
+    Element j is the polynomial over GF(q) whose coefficients are j's base-q digits (degree < m, q^m >= N), and its
+    channels are (t, p_j(t)) for t in GF(q): q*q channels in all, q per element. Two elements share at most m-1
+    channels, so when K*(m-1) < q a set of K elements never covers all the channels of an element it does not hold,
+    and "j is in the set" is exactly "all of j's channels are on". Returns (q, m), or None when one channel per
+    element is narrower."""
+    best = None
+    for q in _primes(62):
+        m = 1
+        while q ** m < N:
+            m += 1
+        if K * (m - 1) < q and q * q < N and (best is None or q < best[0]):
+            best = (q, m)
+    return best
+
+
+def _set_channels(j, q, m):
+    digits = [(j // q ** i) % q for i in range(m)]
+    return [t * q + sum(c * t ** i for i, c in enumerate(digits)) % q for t in range(q)]
+
+
 class _NeedSplit(Exception):
     """A statement uses a value computed earlier in the same step: start a new block."""
 
@@ -1909,8 +1968,12 @@ class Lowering:
                 raise PipeError(f"names starting with {REC} are reserved", n)
         self.decls, self.globals, self.funcs, self.sig = [], {}, {}, {}
         self.depth, self.overflow, self.timeout = None, None, "TIMEOUT"
+        self.sets, self.nmember = {}, 0
         for node in tree.body:
-            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.annotation, ast.Subscript) and \
+                    isinstance(node.annotation.value, ast.Name) and node.annotation.value.id == "Sparse":
+                self._declare_set(node)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 if node.target.id.startswith(REC):
                     raise PipeError(f"names starting with {REC} are reserved", node)
                 self.decls.append(ast.unparse(node))
@@ -1952,7 +2015,7 @@ class Lowering:
         self.body = {}
         for name, f in self.funcs.items():
             self.ntemp[name] = 0
-            self.body[name] = self._hoist(f.body, name)
+            self.body[name] = self._hoist(self._set_pass(f.body, name), name)
             self._collect(name)
             self._typecheck(name)
             if level >= 2:                                   # one operation per step
@@ -1987,6 +2050,190 @@ class Lowering:
         if not isinstance(ann, ast.Name) or self.S.type_of(ann.id) is None:
             raise PipeError(f"unknown type {ast.unparse(ann) if ann is not None else ''}", node)
         return ann.id
+
+    # ---------------------------------------------------------------- sets: Sparse[N, K, CLASS]
+
+    def _global(self, name, t, init):
+        self.decls.append(f"{name}: {t} = {init}")
+        self.globals[name] = t
+
+    def _declare_set(self, node):
+        """s: Sparse[N, K, CLASS] = set(): at most K elements out of 0..N-1, held in Bool channels. When a code
+        narrower than N channels exists, the elements share channels (exact superposition, see _set_code);
+        otherwise there is one channel per element. Adding a K+1-th element ends the program with CLASS."""
+        name = node.target.id if isinstance(node.target, ast.Name) else None
+        sl = node.annotation.slice
+        parts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+        if name is None or len(parts) != 3 or not all(isinstance(x, ast.Constant) and type(x.value) is int
+                                                       for x in parts[:2]) \
+                or not (isinstance(parts[2], ast.Name) and parts[2].id in self.S.classes):
+            raise PipeError("declare a set as name: Sparse[N, K, CLASS] = set(): elements 0..N-1, at most K of them "
+                            f"at once, and CLASS (one of {', '.join(self.S.classes)}) when a K+1-th is added", node)
+        N, K, cls = parts[0].value, parts[1].value, parts[2].id
+        if not (2 <= N <= 256 and 1 <= K < N):
+            raise PipeError("Sparse[N, K, CLASS] needs 2 <= N <= 256 and 1 <= K < N", node)
+        v = node.value
+        if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "set" and not v.args):
+            raise PipeError(f"a set starts empty: {name}: Sparse[...] = set()", node)
+        code = _set_code(N, K)
+        pre = f"{REC}set_{name}"
+        sp = dict(N=N, K=K, cls=cls, code=code, count=f"{pre}_n", idx=f"{pre}_x")
+        if code:
+            q, m = code
+            sp["chans"] = [f"{pre}_c{i}" for i in range(q * q)]
+            sp["members"] = [_set_channels(j, q, m) for j in range(N)]          # element -> its channels
+            sp["ys"] = [f"{pre}_y{t}" for t in range(q)]
+        else:
+            sp["chans"] = [f"{pre}_c{j}" for j in range(N)]
+            sp["members"] = [[j] for j in range(N)]
+            sp["ys"] = [f"{pre}_y{g}" for g in range((N + 31) // 32)] if N > 32 else []
+        for c in sp["chans"] + sp["ys"]:
+            self._global(c, "Bool", "False")
+        self._global(sp["count"], f"Int{K + 1}", 0)
+        self._global(sp["idx"], f"Int{N}", 0)
+        self.sets[name] = sp
+
+    def _gen(self, code, like):
+        """Statements parsed from code, carrying the line number of the statement they replace."""
+        out = ast.parse(code).body
+        for st in out:
+            for n in ast.walk(st):
+                if "lineno" in n._attributes:
+                    n.lineno, n.end_lineno = like.lineno, like.lineno
+                    n.col_offset, n.end_col_offset = 0, 0
+        return out
+
+    def _int_names(self, f, N):
+        """Names in f that are integers of at most N values, usable as an element directly."""
+        ok = lambda t: t.startswith("Int") and t[3:].isdigit() and int(t[3:]) <= N
+        names = {x for x, t in self.globals.items() if ok(t)} | {x for x, t in self.sig[f][0] if ok(t)}
+        for n in ast.walk(ast.Module(body=self.funcs[f].body, type_ignores=[])):
+            if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and isinstance(n.annotation, ast.Name):
+                if ok(n.annotation.id):
+                    names.add(n.target.id)
+                else:
+                    names.discard(n.target.id)
+        return names
+
+    def _set_index(self, sp, x, f, pre, like):
+        """The element as source text: a constant, a small-integer name, or x copied into the set's index (mod N)."""
+        if isinstance(x, ast.Constant) and type(x.value) is int and x.value >= 0:
+            return str(x.value % sp["N"])
+        if isinstance(x, ast.Name) and x.id in self._int_names(f, sp["N"]):
+            return x.id
+        if sp["N"] & (sp["N"] - 1):
+            raise PipeError(f"an element of Sparse[{sp['N']}, ...] must be a constant or an IntM variable with "
+                            f"M <= {sp['N']} ({sp['N']} is not a power of two, so a computed value can't be reduced "
+                            f"mod {sp['N']})", like)
+        pre += self._gen(f"{sp['idx']} = {ast.unparse(x)}", like)
+        return sp["idx"]
+
+    def _set_member(self, sp, ix, pre, like):
+        """Statements computing "ix in s" into a new Bool, and its name. With a code, membership takes two steps:
+        each y_t picks the channel at position t that belongs to ix (q cases), and the member is the AND of the
+        y_t. Each pick is a chain "c_a if ix is one of A else c_b if ... else False": its cases test ix alone and
+        exclude each other, so the compiler handles it in size linear in the number of cases."""
+        self.nmember += 1
+        m = f"{REC}m{self.nmember}"
+        self._global(m, "Bool", "False")
+
+        def pick(cases):                       # cases: (elements, channel)
+            cases = [(js, c) for js, c in cases if js]
+            return "".join(f"{c} if ({' or '.join(f'{ix} == {j}' for j in js)}) else " for js, c in cases) + "False"
+
+        if sp["code"]:
+            q, _ = sp["code"]
+            for t, y in enumerate(sp["ys"]):
+                cases = [([j for j in range(sp["N"]) if sp["members"][j][t] == t * q + v], sp["chans"][t * q + v])
+                         for v in range(q)]
+                pre += self._gen(f"{y} = {pick(cases)}", like)
+            pre += self._gen(f"{m} = {' and '.join(sp['ys'])}", like)
+        elif sp["ys"]:
+            for g, y in enumerate(sp["ys"]):
+                js = range(32 * g, min(32 * g + 32, sp["N"]))
+                pre += self._gen(f"{y} = {pick([([j], sp['chans'][j]) for j in js])}", like)
+            pre += self._gen(f"{m} = {' or '.join(sp['ys'])}", like)
+        else:
+            pre += self._gen(f"{m} = {pick([([j], c) for j, c in enumerate(sp['chans'])])}", like)
+        return m
+
+    def _set_hoist(self, e, f, pre, like):
+        """Replace each "x in s" / "x not in s" in expression e by a Bool computed by statements added to pre."""
+        low = self
+
+        class T(ast.NodeTransformer):
+            def visit_Compare(self, n):
+                if len(n.ops) == 1 and isinstance(n.ops[0], (ast.In, ast.NotIn)) and \
+                        isinstance(n.comparators[0], ast.Name) and n.comparators[0].id in low.sets:
+                    n.left = self.visit(n.left)
+                    sp = low.sets[n.comparators[0].id]
+                    m = low._set_member(sp, low._set_index(sp, n.left, f, pre, like), pre, like)
+                    out = ast.Name(id=m, ctx=ast.Load())
+                    return ast.UnaryOp(op=ast.Not(), operand=out) if isinstance(n.ops[0], ast.NotIn) else out
+                if any(isinstance(o, (ast.In, ast.NotIn)) for o in n.ops):
+                    raise PipeError("`in` tests membership of a set declared as Sparse[N, K, CLASS]", like)
+                return self.generic_visit(n)
+
+            def visit_Name(self, n):
+                if n.id in low.sets:
+                    raise PipeError(f"{n.id} is a set: use x in {n.id}, {n.id}.add(x) or {n.id}.clear()", like)
+                return n
+
+        return T().visit(e)
+
+    def _set_method(self, s, f):
+        call = s.value
+        name, meth = call.func.value.id, call.func.attr
+        sp = self.sets[name]
+        if meth == "clear" and not call.args and not call.keywords:
+            return self._gen("\n".join([f"{c} = False" for c in sp["chans"]] + [f"{sp['count']} = 0"]), s)
+        if meth != "add" or len(call.args) != 1 or call.keywords:
+            raise PipeError(f"sets support {name}.add(x), {name}.clear() and x in {name}", s)
+        pre = []
+        ix = self._set_index(sp, call.args[0], f, pre, s)
+        m = self._set_member(sp, ix, pre, s)
+        sets = []
+        for c, chan in enumerate(sp["chans"]):
+            js = [j for j in range(sp["N"]) if c in sp["members"][j]]
+            if js:
+                sets.append(f"    {chan} = {chan} or " + " or ".join(f"{ix} == {j}" for j in js))
+        code = (f"if not {m}:\n    if {sp['count']} == {sp['K']}:\n        stop({sp['cls']})\n"
+                f"    {sp['count']} = {sp['count']} + 1\n" + "\n".join(sets))
+        return pre + self._gen(code, s)
+
+    def _set_pass(self, stmts, f):
+        """Rewrite set operations into plain statements on the sets' channels."""
+        out = []
+        for s in stmts:
+            pre = []
+            if isinstance(s, ast.While):
+                if any(isinstance(n, ast.Compare) and any(isinstance(o, (ast.In, ast.NotIn)) for o in n.ops)
+                       for n in ast.walk(s.test)):
+                    raise PipeError("a while condition cannot test a set; compute it into a Bool before the loop "
+                                    "and again at the end of the body", s)
+                s.test = self._set_hoist(s.test, f, pre, s)
+                s.body = self._set_pass(s.body, f)
+                out.append(s)
+            elif isinstance(s, ast.If):
+                node = s
+                while True:                       # the whole elif chain: its tests are computed before it
+                    node.test = self._set_hoist(node.test, f, pre, node)
+                    node.body = self._set_pass(node.body, f)
+                    if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                        node = node.orelse[0]
+                    else:
+                        node.orelse = self._set_pass(node.orelse, f)
+                        break
+                out += pre + [s]
+            elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and \
+                    isinstance(s.value.func, ast.Attribute) and isinstance(s.value.func.value, ast.Name) and \
+                    s.value.func.value.id in self.sets:
+                out += self._set_method(s, f)
+            else:
+                if getattr(s, "value", None) is not None:
+                    s.value = self._set_hoist(s.value, f, pre, s)
+                out += pre + [s]
+        return out
 
     def _temp(self, f):
         self.ntemp[f] += 1
@@ -2613,20 +2860,52 @@ class Lowering:
             raise PipeError("a call that is not a tail call needs a stack: add recursion(depth=..., overflow=CLASS)",
                             call)
         K = self._new(f)
-        vals = []
-        for k in saved:
-            reg = self._reg(f, k)
-            val = f"{k[0]}.{k[1]}" if isinstance(k, tuple) and k[0] in st.fresh else reg
-            vals.append((reg[len(REC):], val))
+        # A frame is a pool of Bool channels c0, c1, ... shared by all call sites. Each site packs its saved values
+        # into the pool from c0: a Bool in one channel, a Byte in 8 (one per bit), an enum or IntN in one channel
+        # per value (one-hot). A frame is then as wide as the call site that saves the most channels. The return
+        # block in the frame says which site pushed it, so a restore always unpacks its own layout.
+        vals, restore, k = [], [], 0
+        for key in saved:
+            reg = self._reg(f, key)
+            val = f"{key[0]}.{key[1]}" if isinstance(key, tuple) and key[0] in st.fresh else reg
+            t = self.regs[reg]
+            ch = [f"c{k + i}" for i in range(self._width(t))]
+            k += len(ch)
+            src = [f"{REC}s0_{c}" for c in ch]
+            if t == "Bool":
+                vals.append((ch[0], val))
+                restore.append(f"{reg} = {src[0]}")
+            elif t == "Byte":
+                vals += [(c, f"{REC}bit({val}, {i})") for i, c in enumerate(ch)]
+                restore.append(f"{reg} = {REC}bits({', '.join(src)})")
+            else:
+                names = list(self.S.enums[t]) if t in self.S.enums else [str(i) for i in range(len(ch))]
+                vals += [(c, f"{val} == {nm}") for c, nm in zip(ch, names)]
+                restore.append(f"{reg} = " + "".join(f"{nm} if {c} else " for c, nm in zip(src[:-1], names[:-1]))
+                               + names[-1])
         self.pushes.append(vals)
         lines = [f"@@PUSH {len(self.pushes) - 1} {K}@@"] + _ind(self._args(st, callee, call.args, call))
-        restore = [f"{self._reg(f, k)} = {REC}s0_{self._reg(f, k)[len(REC):]}" for k in saved]
         if x is not None:
             t = self.sig[callee][1]
             self.rvs.add(t)
             restore.append(f"{self._target(st, x)} = {REC}rv_{t}")
         self.blocks[K] = restore + ["@@POP@@"] + self._seq(rest, _Blk(f), cont, live_after)
         return lines
+
+    def _frame(self):
+        """The frame's slots and their types, and its width in channels."""
+        n = max((len(v) for v in self.pushes), default=0)
+        types = {f"c{i}": "Bool" for i in range(n)} | {"ret": f"Int{max(len(self.blocks), 2)}", "v": "Bool"}
+        return types, sum(self._width(t) for t in types.values())
+
+    def _width(self, t):
+        if t == "Bool":
+            return 1
+        if t == "Byte":
+            return 8
+        if t.startswith("Int") and t[3:].isdigit():
+            return int(t[3:])
+        return len(self.S.enums[t])
 
     # ---------------------------------------------------------------- output
 
@@ -2642,13 +2921,9 @@ class Lowering:
         if nb > 256:
             raise PipeError(f"the program needs {nb} blocks; the limit is 256")
         bt = f"Int{max(nb, 2)}"
-        fields = {}
-        for vals in self.pushes:
-            for fld, _ in vals:
-                fields[fld] = self.regs[REC + fld]
+        ftype, _ = self._frame()
         K = self.depth or 0
-        allf = sorted(fields) + ["ret", "v"]
-        ftype = dict(fields, ret=bt, v="Bool")
+        allf = list(ftype)
         out = list(self.decls)
         out.append(f"{REC}blk: {bt} = {self.entry['main']}")
         for t in sorted(self.rvs):
@@ -2698,7 +2973,11 @@ class Lowering:
 
     def report(self):
         return (f"recursion: {len(self.funcs)} functions in {len(self.blocks)} blocks (one per step), "
-                f"stack of {self.depth or 0} frames, {len(self.pushes)} call sites that push")
+                + (f"stack of {self.depth} frames of {self._frame()[1]} channels, {len(self.pushes)} call sites that push"
+                   if self.pushes else "no stack")
+                + "".join(f"\nset {n}: {sp['N']} elements, at most {sp['K']} at once, in {len(sp['chans'])} channels"
+                          + (f" (superposed, Kautz-Singleton code over GF({sp['code'][0]}))" if sp["code"] else "")
+                          for n, sp in self.sets.items()))
 
 
 def _ind(lines):
@@ -2917,7 +3196,7 @@ def _build(src, low, S, network, task, n_check, seed, fit):
         report = [f"fitted network: width {dims['D']}, attention width {dims['Dh']}, {dims['H']} controller units, "
                   f"{dims['Ho']} head units; loop iterations per step {comp.phases}"]
     if low is not None:
-        report.append("  " + low.report())
+        report += ["  " + line for line in low.report().split("\n")]
     for g in comp.groups:
         report.append(f"  lookup into {g['kind']} in iteration {g['phase'] + 1} of each step "
                       f"({len(g['sites'])} call site{'s' if len(g['sites']) > 1 else ''})")

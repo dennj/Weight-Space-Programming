@@ -36,9 +36,11 @@ The **output** is one value of the output type, or one output class (for example
 | `Byte` | 0..255 | 8 bit channels |
 | `IntN`, 2 ≤ N ≤ 256 | 0..N−1 | N one-hot channels |
 | an enum from the schema | its value names | one-hot channels |
+| `Sparse[N, K, C]`, 2 ≤ N ≤ 256 | a set of at most K elements out of 0..N−1 | Bool channels: fewer than N (superposed) when a code allows it, otherwise one per element |
 
 There are no other types: no signed numbers, no multiplication or division, no floating point, no strings, no
-arrays. Record tables are read-only and come from the input.
+arrays. Record tables are read-only and come from the input. Sets exist only in the structured form, as global
+state.
 
 ## 3. Program structure (structured form)
 
@@ -55,6 +57,8 @@ def f(n: Byte) -> Byte:                    # typed parameters and result
 
 - **Global state** is declared at top level as `name: Type = initial`, where the initial value is a query field
   (`query.a`) or a constant. Functions can read and assign it. It is shared: calls do not save it.
+- **Sets** are global state declared as `name: Sparse[N, K, C] = set()`: empty at the start, at most K elements out
+  of 0..N−1, and output class C if a (K+1)-th element is added.
 - **`recursion(depth=K, overflow=C, timeout=T)`**:
   - `depth` is the number of stack frames;
   - `overflow` is the output class when a call would need frame K + 1;
@@ -75,6 +79,8 @@ def f(n: Byte) -> Byte:                    # typed parameters and result
 | `while c:` | loops while `c` holds |
 | `return e` | returns `e`; `return f(args)` is a tail call |
 | `stop(C)` | ends the program with output class `C` |
+| `s.add(x)` | adds element x to set s; adding a (K+1)-th different element ends the program with class C |
+| `s.clear()` | empties set s |
 | `pass` | does nothing |
 
 - **A local's type** comes from its first assignment's annotation, or from the result type of the function it is
@@ -97,6 +103,7 @@ def f(n: Byte) -> Byte:                    # typed parameters and result
 | `a % 2^k` | the low `k` bits |
 | `and`, `or`, `not`, `x if c else y` | logic and choice |
 | `f(args)` | the function's result |
+| `x in s`, `x not in s` | set membership |
 
 - **Exact within an expression.** Values are exact integers within an expression, so `a + b > 255` tests the
   carry, and `a - b < 0` tests the borrow. A value is reduced only when it is stored.
@@ -105,12 +112,15 @@ def f(n: Byte) -> Byte:                    # typed parameters and result
 - **Evaluation order.** Calls inside an expression run first, innermost first and left to right.
 - **Lookups.** The lookup value must stay within the key's range; reduce it with `%` if needed. The compiler checks
   this.
+- **Set elements.** An element x stands for x mod N. When N is not a power of two, x must be a constant or an
+  `IntM` variable with M ≤ N. A `while` condition can't test a set; compute the test into a Bool first.
 
 ## 6. Meaning
 
 - **Calls** pass values. A call that is not a tail call holds one stack frame until it returns. A tail call
   (`return f(x)`) holds none, so tail recursion runs in constant stack space.
-- **The answer** is the value `main()` returns, or the class of `stop(C)`, of a stack overflow, or of the timeout.
+- **The answer** is the value `main()` returns, or the class of `stop(C)`, of a stack overflow, of a set overflow,
+  or of the timeout.
 - **Time is abstract.** The answer of a program that finishes does not depend on how the compiler schedules it. The
   step budget is the network's loop count. Exactly where the timeout falls depends on the schedule, so a program
   meant to finish should stay well inside the budget.

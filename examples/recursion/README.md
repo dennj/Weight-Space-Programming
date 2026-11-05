@@ -74,8 +74,9 @@ The compiler turns the recursion into what a looped network can run:
   entry, one continuation after each of its four kinds of call, `mul`'s entry and loop, `shr`, `main`, and the end.
 - **A stack in the network's state.** A call that is not a tail call pushes a frame: the block to come back to and
   the caller's live values. Here that is `env`, the left operand `l`, and the fields `n.op`, `n.y`, `n.z` that are
-  still needed. The stack is 64 frames of 55 channels in the residual stream. Pushing or popping shifts every frame
-  by one, in one step.
+  still needed. All call sites share one pool of channels per frame, each packing its own values into it (a Byte
+  as 8 bits, `Op` one-hot), so a frame is as wide as the widest call site: the stack is 64 frames of 39 channels in
+  the residual stream. Pushing or popping shifts every frame by one, in one step.
 - **Tail calls** (`return ev(n.y, env)`) jump without pushing, so mutual recursion such as even/odd runs in constant
   stack space.
 
@@ -84,19 +85,19 @@ Compiling it:
 ```
 $ python3 ../../pipec/pipec.py eval.pipe -z
 compiled eval.pipe -> weights.npz
-channels 3966/4096, controller units 16545/17408, head units 11/16, loop iterations per step 1
-  recursion: 4 functions in 10 blocks (one per step), stack of 64 frames, 4 call sites that push
+channels 2942/4096, controller units 12861/17408, head units 11/16, loop iterations per step 1
+  recursion: 4 functions in 10 blocks (one per step), stack of 64 frames of 39 channels, 4 call sites that push
   lookup into program in iteration 1 of each step (1 call site)
 ```
 
-That takes about 30 seconds, most of it the compiler's self-check on 600 random program memories. The plain
-program it compiles, after lowering, is 4,200 lines; `--lowered out.pipe` writes it out.
+That takes about a minute. The plain program it compiles, after lowering, is about 17,000 lines, most of them
+copying stack channels on pushes and pops; `--lowered out.pipe` writes it out.
 
 ## The network
 
 [network.py](network.py) is the same family as MICRO-8's: an encoder; one attention head from a state token over the
 128 node records; a block of 17,408 ReLU units applied up to 65,536 times with shared weights; and an output head.
-It has 146M parameters, of which about 190,000 are nonzero. The largest weight is 2,105.
+It has 146M parameters, of which about 149,000 are nonzero. The largest weight is 2,105.
 
 The runtime is sparse, and an input whose state stops changing leaves the loop. A halted program's state never
 changes again, so this gives the same answer as running all 65,536 iterations. `fib(12)` finishes after 7,434.
@@ -140,7 +141,7 @@ families and generators in [programs.py](programs.py) come from that version. On
 - **Depth per step:** each compiled step is one ReLU layer; each hand-built step was a 60-layer circuit.
 - **What you write:** the hand-built version is a circuit library and a decoder written by hand; this is the
   recursive evaluator above, and the compiler derives the frames.
-- **Cost:** the compiled network is far larger (16,545 units and a 3,520-channel stack in the residual stream,
+- **Cost:** the compiled network is far larger (12,861 units and a 2,496-channel stack in the residual stream,
   against about 1,250 units and a separate memory).
 
 ## Run it
@@ -149,7 +150,7 @@ Python 3.10 or later, NumPy and SciPy (for the sparse runtime).
 
 ```bash
 cd examples/recursion
-python3 ../../pipec/pipec.py eval.pipe -z -o my_weights.npz          # compile: about 30 seconds
+python3 ../../pipec/pipec.py eval.pipe -z -o my_weights.npz          # compile: about a minute
 python3 evaluate.py my_weights.npz                                   # the battery: about 5 minutes
 python3 evaluate.py my_weights.npz --quick                           # a 10% sample: about a minute
 cd ../../pipec && python3 test_pipec.py ../examples/recursion --tests=tests_recursion.py   # compiler tests

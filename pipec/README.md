@@ -44,6 +44,9 @@ then compiles as usual. `--lowered` shows the result.
   back to, and the caller's live values (only those still needed after the call, down to single record fields).
   Pushing and popping shift every frame by one, in one step. A return stores the value and jumps to the block
   saved in the top frame, which restores the values and pops.
+  A frame is a pool of Bool channels shared by all call sites. Each site packs its values into it (a Bool in one
+  channel, a Byte in 8, an enum or `IntN` one-hot), so a frame is as wide as the call site that saves the most
+  channels. The internal functions `rec_bit(x, i)` and `rec_bits(b0, ..., b7)` move a Byte in and out of channels.
 - **Two arithmetic tests.** A Byte comparison that guards Byte arithmetic in the same step would need two
   arithmetic tests in one layer. The comparison is then computed into a Bool one step earlier.
 - **Halting.** Returning from `main()`, `stop()` and a full stack all go through one final block, the only one that
@@ -51,6 +54,26 @@ then compiles as usual. `--lowered` shows the result.
 
 The cost is size: a push or pop copies every frame, so the network grows with stack depth times frame width
 ([examples/recursion/](../examples/recursion/)).
+
+## Sets: superposition as a type
+
+`s: Sparse[N, K, C] = set()` declares a set of at most K elements out of 0..N−1 ([SPEC.md](../SPEC.md)). It is held
+in Bool channels, superposed when a code is narrower than one channel per element:
+
+- **The code** (Kautz–Singleton). Element j is the polynomial p over GF(q) whose coefficients are j's base-q
+  digits, and its channels are (t, p(t)) for every t: q of q² channels. Two elements share at most m−1 channels
+  (m is the number of digits), so when K·(m−1) < q a set of K elements never covers an element it doesn't hold,
+  and "j in s" is exactly "all of j's channels are on". The compiler picks the smallest such q; for example 64
+  elements fit in 49 channels with K = 3, and 128 in 121 with K = 5. Without such a code, a set has one channel
+  per element.
+- **`x in s`** takes two steps: q Bools each pick x's channel at one position, then their AND. Each pick is a chain
+  whose cases test x alone, so it stays small.
+- **`s.add(x)`** tests membership first. A new element either increments a counter or, when the set already has K,
+  stops with class C. Then it turns on x's channels.
+
+Every channel stays 0 or 1, and every step is one layer, so a set compiles like any other program and the
+self-check verifies it. [experiments/exact_superposition.py](../experiments/exact_superposition.py) checks the code
+exhaustively on its own.
 
 ## Always compiles: scheduling and sizing
 
@@ -128,6 +151,7 @@ python3 test_pipec.py ../examples/micro8             # about 15 seconds
 python3 test_pipec.py ../examples/micro8 --battery   # also scores the TASK programs on the full battery
 python3 test_pipec.py ../examples/recursion --tests=tests_recursion.py   # functions and recursion: about 4 minutes
 python3 test_pipec.py ../examples/recursion --tests=tests_total.py       # programs that need rescheduling: about 2 minutes
+python3 test_pipec.py ../examples/recursion --tests=tests_sparse.py      # sets: about 2 minutes
 ```
 
 - [tests_micro8.py](tests_micro8.py) holds programs for other problems on the MICRO-8 schema, two complete MICRO-8
@@ -138,6 +162,9 @@ python3 test_pipec.py ../examples/recursion --tests=tests_total.py       # progr
 - [tests_total.py](tests_total.py) holds programs that do not fit one layer per step as written. Examples: chained
   operations, two comparisons in one condition, a lookup keyed by another lookup's field, a conditional expression
   inside a comparison. Each is also checked against its intended answer computed in Python (`EXPECT`).
+- [tests_sparse.py](tests_sparse.py) holds programs with sets: superposed and one-channel-per-element sets,
+  duplicates, `clear()`, a set overflow, and a walk over the program table that stops when a node repeats. Each is
+  checked against its intended answer (`EXPECT`), and invalid uses must be rejected.
 
 Each program is compiled and compared with the compiler's interpreter on 3,000 fresh random inputs.
 
@@ -145,5 +172,5 @@ Each program is compiled and compared with the compiler's interpreter on 3,000 f
 
 This is the compiler used in the experiment ([examples/micro8/README.md](../examples/micro8/README.md#the-experiment)),
 plus things added afterwards: the `relu_margin` and `tanh` targets, the functions-and-recursion front end with its
-scheduling levels and static type checks, `--fit`, and `IntN` up to 256. For programs without functions, the default target's output is byte-identical to the frozen copy
+scheduling levels and static type checks, `--fit`, `IntN` up to 256, shared stack frames, and sets. For programs without functions, the default target's output is byte-identical to the frozen copy
 the agents used.

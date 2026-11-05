@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 my_weights.npz
 docs/pipes_*.svg
+docs/superposition_*.svg

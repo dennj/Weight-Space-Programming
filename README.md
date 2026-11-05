@@ -37,7 +37,7 @@ python3 ../../pipec/pipec.py program.pipe -o my_weights.npz   # compile: about h
 python3 evaluate.py my_weights.npz                            # the 618,401-program test battery: a few minutes
 
 cd ../recursion
-python3 ../../pipec/pipec.py eval.pipe -z -o my_weights.npz   # compile the recursive evaluator: about 30 seconds
+python3 ../../pipec/pipec.py eval.pipe -z -o my_weights.npz   # compile the recursive evaluator: about a minute
 python3 evaluate.py my_weights.npz                            # the 8,648-program battery: about 5 minutes
 ```
 
@@ -46,10 +46,11 @@ python3 evaluate.py my_weights.npz                            # the 8,648-progra
 | Path | Contents |
 |---|---|
 | [SPEC.md](SPEC.md) | the Pipe language: types, statements, meaning, and what always compiles |
-| [docs/](docs/) | the script that draws the article's pipe figure from a real network and checks what the article says about it |
+| [docs/](docs/) | the scripts that draw the articles' figures: the pipes of a real network, and the superposition code |
 | [pipec/](pipec/) | the compiler (one file), functions and recursion, its tests, and how to target another network |
 | [examples/micro8/](examples/micro8/) | the 8-bit CPU: specification, network, program, compiled weights, test battery, and the experiment |
 | [examples/recursion/](examples/recursion/) | a recursive evaluator: specification, network, program, compiled weights, program families and test battery |
+| [experiments/](experiments/) | [exact_superposition.py](experiments/exact_superposition.py): exhaustive checks of the superposition code behind the `Sparse` set type: many sparse flags in far fewer channels, read back exactly |
 
 ## The experiment
 
