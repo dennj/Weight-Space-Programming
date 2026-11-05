@@ -1,0 +1,77 @@
+"""A recursive evaluator for the expression programs in memory (EXPR-128).
+
+ev(node, env) evaluates one node with argument env. The compiler turns the recursion into a stack of frames held in
+the network's state: a call that is not a tail call saves the caller's live values; a return restores them.
+"""
+
+recursion(depth=64, overflow=FAULT, timeout=TIMEOUT)
+
+
+def main() -> Byte:
+    return ev(query.root, query.arg)
+
+
+def ev(node: Int128, env: Byte) -> Byte:
+    n = attend(program.addr, node)
+    if n.op == CONST:
+        return n.imm
+    elif n.op == ARG:
+        return env
+    elif n.op == IF:
+        c: Byte = ev(n.x, env)
+        if c != 0:
+            return ev(n.y, env)
+        return ev(n.z, env)
+    elif n.op == CALL:
+        a: Byte = ev(n.x, env)          # the argument, in the caller's environment
+        return ev(n.y, a)               # the body, with the new argument
+    elif n.op == NOP:
+        stop(FAULT)
+    else:
+        l: Byte = ev(n.x, env)
+        r: Byte = ev(n.y, env)
+        if n.op == ADD:
+            return l + r
+        elif n.op == SUB:
+            return l - r
+        elif n.op == MUL:
+            return mul(l, r)
+        elif n.op == LEQ:
+            return 1 if l <= r else 0
+        elif n.op == BAND:
+            return l & r
+        elif n.op == BXOR:
+            return l ^ r
+        return shr(l, r >= 8, r)
+
+
+def mul(a: Byte, b: Byte) -> Byte:
+    acc: Byte = 0
+    i: Int9 = 0
+    while i != 8:                       # shift and add: one bit of b per step
+        if (b & 1) == 1:
+            acc = acc + a
+        a = a << 1
+        b = b >> 1
+        i = i + 1
+    return acc
+
+
+def shr(a: Byte, big: Bool, k: Int8) -> Byte:
+    if big:                             # a shift of 8 or more
+        return 0
+    elif k == 0:
+        return a
+    elif k == 1:
+        return a >> 1
+    elif k == 2:
+        return a >> 2
+    elif k == 3:
+        return a >> 3
+    elif k == 4:
+        return a >> 4
+    elif k == 5:
+        return a >> 5
+    elif k == 6:
+        return a >> 6
+    return a >> 7

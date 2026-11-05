@@ -1,0 +1,70 @@
+"""MICRO-8 interpreter: one executed instruction per step (16 steps = at most 16 instructions)."""
+
+A: Byte = query.a
+B: Byte = query.b
+Z: Bool = False
+C: Bool = False
+R: Int16 = 0
+pc: Int16 = 0
+
+
+def step():
+    ins = attend(program.addr, pc)      # iteration 1: fetch the instruction at pc
+    op = ins.op
+    arg = ins.arg
+    nxt = pc + 1                        # fall-through pc (wraps mod 16 when stored)
+    t = arg % 16                        # jump target
+    if op == HALT:
+        halt
+    pc = nxt                            # default: next instruction; jumps override below
+    if op == LDI:
+        A = arg
+    elif op == LD:
+        A = attend(data.daddr, arg % 8).value     # iteration 2 (shared with LDX)
+    elif op == LDX:
+        A = attend(data.daddr, B % 8).value
+    elif op == ADD:
+        C = A + arg > 255                         # carry out (old A)
+        Z = (A + arg) % 256 == 0                  # new A == 0
+        A = A + arg
+    elif op == SUB:
+        C = A < arg                               # borrow (old A)
+        Z = A == arg                              # A - arg == 0 mod 256
+        A = A - arg
+    elif op == ADDB:
+        C = A + B > 255
+        Z = (A + B) % 256 == 0
+        A = A + B
+    elif op == AND:
+        A = A & arg
+        Z = A == 0                                # finished at the start of the next step
+    elif op == XOR:
+        Z = A == arg                              # A ^ arg == 0  <=>  A == arg
+        A = A ^ arg
+    elif op == SHL:
+        C = A > 127                               # old bit 7
+        Z = (A & 127) == 0                        # new A = (A * 2) mod 256 is 0
+        A = A << 1
+    elif op == MOVB:
+        B = A
+    elif op == JZ:
+        if Z:
+            pc = t
+    elif op == JC:
+        if C:
+            pc = t
+    elif op == DJNZ:
+        if B != 1:                                # new B = B - 1 is nonzero
+            pc = t
+        B = B - 1
+    elif op == CALL:
+        R = nxt
+        pc = t
+    else:                                         # RET (the only opcode left)
+        pc = R
+
+
+def output():
+    if halted:
+        return A
+    return TIMEOUT
